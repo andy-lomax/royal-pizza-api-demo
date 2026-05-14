@@ -778,6 +778,19 @@ function buildWooProductsUrl({ categoryId, page, perPage }) {
   return url;
 }
 
+function buildStoreProductsUrl({ categoryId, page, perPage }) {
+  const url = new URL("/wp-json/wc/store/v1/products", siteUrl());
+
+  url.searchParams.set("per_page", String(perPage));
+  url.searchParams.set("page", String(page));
+
+  if (categoryId) {
+    url.searchParams.set("category", categoryId);
+  }
+
+  return url;
+}
+
 function buildWooProductUrl(productId) {
   const url = new URL(
     `/wp-json/wc/v3/products/${encodeURIComponent(productId)}`,
@@ -798,6 +811,15 @@ function buildWooCategoriesUrl({ page, perPage }) {
     "_fields",
     ["id", "name", "slug", "count", "menu_order"].join(","),
   );
+
+  return url;
+}
+
+function buildStoreCategoriesUrl({ page, perPage }) {
+  const url = new URL("/wp-json/wc/store/v1/products/categories", siteUrl());
+
+  url.searchParams.set("per_page", String(perPage));
+  url.searchParams.set("page", String(page));
 
   return url;
 }
@@ -835,9 +857,18 @@ function buildWooCountryUrl(country) {
 }
 
 function normalizeWooProduct(product) {
-  const price = numericText(product.price);
-  const regularPrice = numericText(product.regular_price) || price;
-  const salePrice = numericText(product.sale_price) || price || regularPrice;
+  const productPrices =
+    product?.prices && typeof product.prices === "object" ? product.prices : {};
+  const price = numericText(product.price) || numericText(productPrices.price);
+  const regularPrice =
+    numericText(product.regular_price) ||
+    numericText(productPrices.regular_price) ||
+    price;
+  const salePrice =
+    numericText(product.sale_price) ||
+    numericText(productPrices.sale_price) ||
+    price ||
+    regularPrice;
 
   return {
     id: product.id,
@@ -851,8 +882,10 @@ function normalizeWooProduct(product) {
       price: price || salePrice || regularPrice,
       regular_price: regularPrice,
       sale_price: salePrice,
-      currency_code: "THB",
-      currency_minor_unit: 0,
+      currency_code: textValue(productPrices.currency_code) || "THB",
+      currency_minor_unit: Number.isFinite(productPrices.currency_minor_unit)
+        ? productPrices.currency_minor_unit
+        : 0,
     },
     images: Array.isArray(product.images)
       ? product.images.map((image) => ({
@@ -910,6 +943,10 @@ async function fetchWooProductsPage({ categoryId, page, perPage }) {
   );
 
   if (!upstreamResponse.ok) {
+    if ([401, 403].includes(upstreamResponse.status)) {
+      return fetchStoreProductsPage({ categoryId, page, perPage });
+    }
+
     throw new Error(
       `WooCommerce products request failed with HTTP ${upstreamResponse.status}.`,
     );
@@ -923,7 +960,7 @@ async function fetchWooProductsPage({ categoryId, page, perPage }) {
 
   return {
     products: body
-      .filter((product) => product?.status === "publish")
+      .filter((product) => product?.status === undefined || product?.status === "publish")
       .map(normalizeWooProduct),
     total: upstreamResponse.headers.get("x-wp-total") ?? String(body.length),
     totalPages: upstreamResponse.headers.get("x-wp-totalpages") ?? "1",
@@ -939,6 +976,10 @@ async function fetchWooCategoriesPage({ page, perPage }) {
   });
 
   if (!upstreamResponse.ok) {
+    if ([401, 403].includes(upstreamResponse.status)) {
+      return fetchStoreCategoriesPage({ page, perPage });
+    }
+
     throw new Error(
       `WooCommerce categories request failed with HTTP ${upstreamResponse.status}.`,
     );
@@ -948,6 +989,63 @@ async function fetchWooCategoriesPage({ page, perPage }) {
 
   if (!Array.isArray(body)) {
     throw new Error("WooCommerce categories response was not an array.");
+  }
+
+  return {
+    categories: body.map(normalizeWooCategory),
+    total: upstreamResponse.headers.get("x-wp-total") ?? String(body.length),
+    totalPages: upstreamResponse.headers.get("x-wp-totalpages") ?? "1",
+  };
+}
+
+async function fetchStoreProductsPage({ categoryId, page, perPage }) {
+  const upstreamResponse = await fetch(
+    buildStoreProductsUrl({ categoryId, page, perPage }),
+    {
+      headers: {
+        Accept: "application/json",
+      },
+    },
+  );
+
+  if (!upstreamResponse.ok) {
+    throw new Error(
+      `WooCommerce Store API products request failed with HTTP ${upstreamResponse.status}.`,
+    );
+  }
+
+  const body = await upstreamResponse.json();
+
+  if (!Array.isArray(body)) {
+    throw new Error("WooCommerce Store API products response was not an array.");
+  }
+
+  return {
+    products: body
+      .filter((product) => product?.status === undefined || product?.status === "publish")
+      .map(normalizeWooProduct),
+    total: upstreamResponse.headers.get("x-wp-total") ?? String(body.length),
+    totalPages: upstreamResponse.headers.get("x-wp-totalpages") ?? "1",
+  };
+}
+
+async function fetchStoreCategoriesPage({ page, perPage }) {
+  const upstreamResponse = await fetch(buildStoreCategoriesUrl({ page, perPage }), {
+    headers: {
+      Accept: "application/json",
+    },
+  });
+
+  if (!upstreamResponse.ok) {
+    throw new Error(
+      `WooCommerce Store API categories request failed with HTTP ${upstreamResponse.status}.`,
+    );
+  }
+
+  const body = await upstreamResponse.json();
+
+  if (!Array.isArray(body)) {
+    throw new Error("WooCommerce Store API categories response was not an array.");
   }
 
   return {
