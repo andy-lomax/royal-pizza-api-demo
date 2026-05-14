@@ -238,6 +238,18 @@ async function fetchWooCustomerByEmail(email) {
   return Array.isArray(body) ? body[0] : undefined;
 }
 
+async function fetchWooCustomerByEmailForLogin(email) {
+  try {
+    return await fetchWooCustomerByEmail(email);
+  } catch (error) {
+    console.warn(
+      "WooCommerce customer lookup failed after JWT login:",
+      error instanceof Error ? error.message : error,
+    );
+    return undefined;
+  }
+}
+
 async function fetchWooCustomerById(customerId) {
   const upstreamResponse = await fetch(
     new URL(`/wp-json/wc/v3/customers/${encodeURIComponent(customerId)}`, siteUrl()),
@@ -481,7 +493,7 @@ async function serveAccountEndpoint(request, response, requestUrl) {
 
     try {
       const jwt = await jwtLogin({ email, password });
-      const wooCustomer = await fetchWooCustomerByEmail(jwt.email);
+      const wooCustomer = await fetchWooCustomerByEmailForLogin(jwt.email);
       const customer = normalizeWooCustomer(wooCustomer, jwt);
       const sessionToken = createSession({ customer, jwtToken: jwt.token });
 
