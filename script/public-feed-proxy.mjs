@@ -178,6 +178,21 @@ function persistAccountSessions() {
   }
 }
 
+async function fetchWithTimeout(url, init = {}, timeoutMs = 12000) {
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+    return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function createSession({ customer, jwtToken = "" }) {
   const token = `rp_${Date.now().toString(36)}_${Math.random()
     .toString(36)
@@ -190,6 +205,45 @@ function createSession({ customer, jwtToken = "" }) {
 
 function normalizeWooCustomer(customer, fallback = {}) {
   return normalizeWooCustomerProfile(customer, fallback);
+}
+
+async function fetchWooCustomerForSession(customer) {
+  if (customer?.id) {
+    try {
+      const wooCustomer = await fetchWooCustomerById(customer.id);
+
+      if (wooCustomer) {
+        return wooCustomer;
+      }
+    } catch (error) {
+      console.warn(
+        "WooCommerce customer lookup by ID failed:",
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }
+
+  if (customer?.email) {
+    return fetchWooCustomerByEmailForLogin(customer.email);
+  }
+
+  return undefined;
+}
+
+async function refreshSessionCustomer(request) {
+  const token = bearerToken(request);
+  const session = token ? accountSessions.get(token) : undefined;
+
+  if (!session?.customer) {
+    return undefined;
+  }
+
+  const wooCustomer = await fetchWooCustomerForSession(session.customer);
+  const nextCustomer = normalizeWooCustomer(wooCustomer, session.customer);
+
+  accountSessions.set(token, { ...session, customer: nextCustomer });
+  persistAccountSessions();
+  return nextCustomer;
 }
 
 async function jwtLogin({ email, password }) {
@@ -223,17 +277,9 @@ async function fetchWooCustomerByEmail(email) {
   url.searchParams.set("email", email);
   url.searchParams.set("per_page", "1");
 
-  const upstreamResponse = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      Authorization: menuFeedAuthorization(),
-    },
+  const { body } = await fetchWooApiJson(url, {
+    fallbackMessage: "Could not load WooCommerce customer.",
   });
-  const body = await upstreamResponse.json().catch(() => []);
-
-  if (!upstreamResponse.ok) {
-    throw new Error(textValue(body?.message) || "Could not load WooCommerce customer.");
-  }
 
   return Array.isArray(body) ? body[0] : undefined;
 }
@@ -251,20 +297,12 @@ async function fetchWooCustomerByEmailForLogin(email) {
 }
 
 async function fetchWooCustomerById(customerId) {
-  const upstreamResponse = await fetch(
+  const { body } = await fetchWooApiJson(
     new URL(`/wp-json/wc/v3/customers/${encodeURIComponent(customerId)}`, siteUrl()),
     {
-      headers: {
-        Accept: "application/json",
-        Authorization: menuFeedAuthorization(),
-      },
+      fallbackMessage: "Could not load WooCommerce customer.",
     },
   );
-  const body = await upstreamResponse.json().catch(() => ({}));
-
-  if (!upstreamResponse.ok) {
-    throw new Error(textValue(body?.message) || "Could not load WooCommerce customer.");
-  }
 
   return body;
 }
@@ -283,6 +321,9 @@ function normalizeWooOrder(order) {
       textValue(order?.shipping_lines?.[0]?.method_title) ||
       textValue(order?.meta_data?.find((meta) => meta?.key === "delivery_type")?.value) ||
       "Delivery",
+    billingFirstName: textValue(order?.billing?.first_name),
+    billingLastName: textValue(order?.billing?.last_name),
+    billingEmail: emailValue(order?.billing?.email),
     billingAddress: appAddressPayload(order?.billing ?? {}),
     shippingAddress: appShippingAddressPayload(order?.shipping ?? {}),
   };
@@ -292,6 +333,62 @@ function wordpressAccountAuthorization() {
   return `Basic ${Buffer.from(
     `${requireEnv("WORDPRESS_USERNAME")}:${requireEnv("WORDPRESS_APP_PASSWORD")}`,
   ).toString("base64")}`;
+}
+
+function optionalBasicAuthorization(usernameKey, passwordKey) {
+  const username = process.env[usernameKey];
+  const password = process.env[passwordKey];
+
+  return username && password
+    ? `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`
+    : "";
+}
+
+function wooAccountAuthorizations() {
+  return [
+    optionalBasicAuthorization(
+      "WOOCOMMERCE_CONSUMER_KEY",
+      "WOOCOMMERCE_CONSUMER_SECRET",
+    ),
+    optionalBasicAuthorization("WORDPRESS_USERNAME", "WORDPRESS_APP_PASSWORD"),
+  ].filter((authorization, index, authorizations) => {
+    return authorization && authorizations.indexOf(authorization) === index;
+  });
+}
+
+async function fetchWooApiJson(url, { fallbackMessage, timeoutMs = 12000 }) {
+  const authorizations = wooAccountAuthorizations();
+  let lastMessage = fallbackMessage;
+
+  if (!authorizations.length) {
+    throw new Error("WooCommerce or WordPress account credentials are required.");
+  }
+
+  for (const authorization of authorizations) {
+    const upstreamResponse = await fetchWithTimeout(
+      url,
+      {
+        headers: {
+          Accept: "application/json",
+          Authorization: authorization,
+        },
+      },
+      timeoutMs,
+    );
+    const body = await upstreamResponse.json().catch(() => ({}));
+
+    if (upstreamResponse.ok) {
+      return { body, status: upstreamResponse.status };
+    }
+
+    lastMessage = textValue(body?.message) || fallbackMessage;
+
+    if (upstreamResponse.status !== 401 && upstreamResponse.status !== 403) {
+      break;
+    }
+  }
+
+  throw new Error(lastMessage);
 }
 
 function unavailableLoyaltyPoints(message) {
@@ -343,7 +440,7 @@ async function fetchMyRewardsPoints(customer) {
     url.searchParams.set("stack", process.env.MYREWARDS_POINTS_POOL_ID);
   }
 
-  const upstreamResponse = await fetch(url, {
+  const upstreamResponse = await fetchWithTimeout(url, {
     headers: {
       Accept: "application/json",
       Authorization: wordpressAccountAuthorization(),
@@ -378,17 +475,10 @@ async function fetchWooOrders(params) {
     }
   }
 
-  const upstreamResponse = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      Authorization: menuFeedAuthorization(),
-    },
+  const { body } = await fetchWooApiJson(url, {
+    fallbackMessage: "Could not load WooCommerce orders.",
+    timeoutMs: 45000,
   });
-  const body = await upstreamResponse.json().catch(() => []);
-
-  if (!upstreamResponse.ok) {
-    throw new Error(textValue(body?.message) || "Could not load WooCommerce orders.");
-  }
 
   return Array.isArray(body) ? body.map(normalizeWooOrder) : [];
 }
@@ -575,7 +665,7 @@ async function serveAccountEndpoint(request, response, requestUrl) {
   }
 
   if (requestUrl.pathname === "/api/account/me" && request.method === "GET") {
-    const customer = sessionCustomer(request);
+    const customer = await refreshSessionCustomer(request);
 
     if (!customer) {
       sendJson(response, 401, { message: "Account session required." }, {}, request.method);
@@ -671,7 +761,7 @@ async function serveAccountEndpoint(request, response, requestUrl) {
   }
 
   if (requestUrl.pathname === "/api/account/orders" && request.method === "GET") {
-    const customer = sessionCustomer(request);
+    const customer = await refreshSessionCustomer(request);
 
     if (!customer) {
       sendJson(response, 401, { message: "Account session required." }, {}, request.method);
@@ -698,7 +788,7 @@ async function serveAccountEndpoint(request, response, requestUrl) {
   }
 
   if (requestUrl.pathname === "/api/account/loyalty-points" && request.method === "GET") {
-    const customer = sessionCustomer(request);
+    const customer = await refreshSessionCustomer(request);
 
     if (!customer) {
       sendJson(response, 401, { message: "Account session required." }, {}, request.method);
@@ -753,6 +843,8 @@ function buildWooProductsUrl({ categoryId, page, perPage }) {
   url.searchParams.set("status", "publish");
   url.searchParams.set("per_page", String(perPage));
   url.searchParams.set("page", String(page));
+  url.searchParams.set("orderby", "menu_order");
+  url.searchParams.set("order", "asc");
   url.searchParams.set(
     "_fields",
     [
@@ -783,6 +875,8 @@ function buildStoreProductsUrl({ categoryId, page, perPage }) {
 
   url.searchParams.set("per_page", String(perPage));
   url.searchParams.set("page", String(page));
+  url.searchParams.set("orderby", "menu_order");
+  url.searchParams.set("order", "asc");
 
   if (categoryId) {
     url.searchParams.set("category", categoryId);
@@ -807,6 +901,8 @@ function buildWooCategoriesUrl({ page, perPage }) {
 
   url.searchParams.set("per_page", String(perPage));
   url.searchParams.set("page", String(page));
+  url.searchParams.set("orderby", "menu_order");
+  url.searchParams.set("order", "asc");
   url.searchParams.set(
     "_fields",
     ["id", "name", "slug", "count", "menu_order"].join(","),
@@ -1599,6 +1695,8 @@ export async function handlePublicFeedProxyRequest(request, response) {
       {
         ok: true,
         service: "royal-pizza-api",
+        accountProfileRefresh: true,
+        wooAccountAuthFallback: true,
       },
       {},
       request.method,
