@@ -112,10 +112,14 @@ function requireEnv(key) {
 }
 
 function siteUrl() {
-  return (process.env.WORDPRESS_SITE_URL || "https://www.royalpizza.co.th").replace(
-    /\/+$/,
-    "",
-  );
+  const fallback = "https://www.royalpizza.co.th";
+  const configured = (process.env.WORDPRESS_SITE_URL || fallback).replace(/\/+$/, "");
+
+  try {
+    return new URL(configured).origin;
+  } catch {
+    return fallback;
+  }
 }
 
 function textValue(value) {
