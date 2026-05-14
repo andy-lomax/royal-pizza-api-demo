@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: royal-pizza-api-demo
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm run start:api
+    envVars:
+      - key: WORDPRESS_SITE_URL
+        sync: false
+      - key: WOOCOMMERCE_CONSUMER_KEY
+        sync: false
+      - key: WOOCOMMERCE_CONSUMER_SECRET
+        sync: false
+      - key: PPOM_SECRET_KEY
+        sync: false
+      - key: WORDPRESS_USERNAME
+        sync: false
+      - key: WORDPRESS_PASSWORD
+        sync: false
+      - key: WORDPRESS_APP_PASSWORD
+        sync: false
+      - key: MYREWARDS_POINTS_POOL_ID
+        sync: false
