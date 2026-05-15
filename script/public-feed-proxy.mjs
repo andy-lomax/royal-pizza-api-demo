@@ -901,8 +901,6 @@ function buildWooCategoriesUrl({ page, perPage }) {
 
   url.searchParams.set("per_page", String(perPage));
   url.searchParams.set("page", String(page));
-  url.searchParams.set("orderby", "menu_order");
-  url.searchParams.set("order", "asc");
   url.searchParams.set(
     "_fields",
     ["id", "name", "slug", "count", "menu_order"].join(","),
@@ -1072,7 +1070,7 @@ async function fetchWooCategoriesPage({ page, perPage }) {
   });
 
   if (!upstreamResponse.ok) {
-    if ([401, 403].includes(upstreamResponse.status)) {
+    if ([400, 401, 403].includes(upstreamResponse.status)) {
       return fetchStoreCategoriesPage({ page, perPage });
     }
 
