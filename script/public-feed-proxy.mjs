@@ -356,9 +356,13 @@ function wooAccountAuthorizations() {
   });
 }
 
-async function fetchWooApiJson(url, { fallbackMessage, timeoutMs = 12000 }) {
+async function fetchWooApiJson(
+  url,
+  { fallbackMessage, timeoutMs = 12000, method = "GET", body },
+) {
   const authorizations = wooAccountAuthorizations();
   let lastMessage = fallbackMessage;
+  const payload = body === undefined ? undefined : JSON.stringify(body);
 
   if (!authorizations.length) {
     throw new Error("WooCommerce or WordPress account credentials are required.");
@@ -368,10 +372,13 @@ async function fetchWooApiJson(url, { fallbackMessage, timeoutMs = 12000 }) {
     const upstreamResponse = await fetchWithTimeout(
       url,
       {
+        method,
         headers: {
           Accept: "application/json",
+          ...(payload ? { "Content-Type": "application/json" } : {}),
           Authorization: authorization,
         },
+        ...(payload ? { body: payload } : {}),
       },
       timeoutMs,
     );
@@ -506,14 +513,10 @@ async function fetchWooCustomerOrders(customer) {
 }
 
 async function createWooCustomer({ firstName, lastName, email, phone, password }) {
-  const upstreamResponse = await fetch(new URL("/wp-json/wc/v3/customers", siteUrl()), {
+  const { body } = await fetchWooApiJson(new URL("/wp-json/wc/v3/customers", siteUrl()), {
     method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-      Authorization: menuFeedAuthorization(),
-    },
-    body: JSON.stringify({
+    fallbackMessage: "Could not create WooCommerce customer.",
+    body: {
       email,
       first_name: firstName,
       last_name: lastName,
@@ -531,13 +534,8 @@ async function createWooCustomer({ firstName, lastName, email, phone, password }
         last_name: lastName,
         country: "TH",
       },
-    }),
+    },
   });
-  const body = await upstreamResponse.json().catch(() => ({}));
-
-  if (!upstreamResponse.ok) {
-    throw new Error(textValue(body?.message) || "Could not create WooCommerce customer.");
-  }
 
   return body;
 }
@@ -549,23 +547,14 @@ async function updateWooCustomer(customer) {
     throw new Error("WooCommerce customer ID is required to save account details.");
   }
 
-  const upstreamResponse = await fetch(
+  const { body } = await fetchWooApiJson(
     new URL(`/wp-json/wc/v3/customers/${encodeURIComponent(customerId)}`, siteUrl()),
     {
       method: "PUT",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        Authorization: menuFeedAuthorization(),
-      },
-      body: JSON.stringify(buildWooCustomerUpdatePayload(customer)),
+      fallbackMessage: "Could not save WooCommerce customer.",
+      body: buildWooCustomerUpdatePayload(customer),
     },
   );
-  const body = await upstreamResponse.json().catch(() => ({}));
-
-  if (!upstreamResponse.ok) {
-    throw new Error(textValue(body?.message) || "Could not save WooCommerce customer.");
-  }
 
   return body;
 }
