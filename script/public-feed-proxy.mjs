@@ -14,6 +14,10 @@ import {
   loadAccountSessions,
   saveAccountSessions,
 } from "./account-session-store.mjs";
+import {
+  createAccountSessionToken,
+  restoreAccountSessionToken,
+} from "./account-session-token.mjs";
 import { notifyAcceptedOrder } from "./order-notifications.mjs";
 
 const port = Number(process.env.PUBLIC_FEED_PROXY_PORT || process.env.PORT || 8091);
@@ -161,9 +165,27 @@ function bearerToken(request) {
 
 function sessionCustomer(request) {
   const token = bearerToken(request);
-  const session = token ? accountSessions.get(token) : undefined;
+  const session = token ? accountSessionFromToken(token) : undefined;
 
   return session?.customer;
+}
+
+function accountSessionSecret() {
+  return (
+    process.env.ACCOUNT_SESSION_SECRET ||
+    process.env.WORDPRESS_APP_PASSWORD ||
+    process.env.WORDPRESS_PASSWORD ||
+    process.env.WOOCOMMERCE_CONSUMER_SECRET ||
+    "royal-pizza-local-account-session"
+  );
+}
+
+function accountSessionFromToken(token) {
+  return (
+    accountSessions.get(token) ||
+    restoreAccountSessionToken(token, { secret: accountSessionSecret() }) ||
+    undefined
+  );
 }
 
 function persistAccountSessions() {
@@ -194,9 +216,10 @@ async function fetchWithTimeout(url, init = {}, timeoutMs = 12000) {
 }
 
 function createSession({ customer, jwtToken = "" }) {
-  const token = `rp_${Date.now().toString(36)}_${Math.random()
-    .toString(36)
-    .slice(2, 12)}`;
+  const token = createAccountSessionToken({
+    customer,
+    secret: accountSessionSecret(),
+  });
 
   accountSessions.set(token, { customer, jwtToken });
   persistAccountSessions();
@@ -232,7 +255,7 @@ async function fetchWooCustomerForSession(customer) {
 
 async function refreshSessionCustomer(request) {
   const token = bearerToken(request);
-  const session = token ? accountSessions.get(token) : undefined;
+  const session = token ? accountSessionFromToken(token) : undefined;
 
   if (!session?.customer) {
     return undefined;

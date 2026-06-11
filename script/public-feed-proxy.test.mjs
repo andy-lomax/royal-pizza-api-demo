@@ -129,6 +129,7 @@ describe("public feed proxy account endpoints", () => {
     );
 
     expect(response.status).toBe(200);
+    expect(response.json().sessionToken).toMatch(/^rps_/);
     expect(response.json().customer).toMatchObject({
       id: 123,
       email: "andy@example.test",
