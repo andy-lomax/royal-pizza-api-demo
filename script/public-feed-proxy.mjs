@@ -32,6 +32,9 @@ const allowedPrefixes = [
   "/wp-json/wcsdm-ml/v1/",
 ];
 const accountSessions = loadAccountSessions(accountSessionFile);
+const ppomProductPageFieldsCache = new Map();
+const ppomProductPageFieldsInflight = new Map();
+const ppomProductPageFieldsCacheTtlMs = 1000 * 60 * 30;
 
 function parseEnvValue(value) {
   const trimmed = value.trim();
@@ -1720,6 +1723,33 @@ async function fetchPpomProductPageConditions(productId) {
 }
 
 async function fetchPpomProductPageFields(productId) {
+  const cached = ppomProductPageFieldsCache.get(productId);
+
+  if (cached && Date.now() - cached.storedAt < ppomProductPageFieldsCacheTtlMs) {
+    return cached.fields;
+  }
+
+  const inflight = ppomProductPageFieldsInflight.get(productId);
+
+  if (inflight) {
+    return inflight;
+  }
+
+  const request = fetchPpomProductPageFieldsUncached(productId).then((fields) => {
+    ppomProductPageFieldsCache.set(productId, { fields, storedAt: Date.now() });
+    return fields;
+  });
+
+  ppomProductPageFieldsInflight.set(productId, request);
+
+  try {
+    return await request;
+  } finally {
+    ppomProductPageFieldsInflight.delete(productId);
+  }
+}
+
+async function fetchPpomProductPageFieldsUncached(productId) {
   const permalink = await fetchWooProductPermalink(productId);
 
   if (!permalink) {
@@ -1934,6 +1964,70 @@ async function servePpomOptionSets(request, response, requestUrl) {
   );
 }
 
+function parseProductIds(value) {
+  const seenProductIds = new Set();
+
+  return textValue(value)
+    .split(",")
+    .flatMap((rawProductId) => {
+      const productId = textValue(rawProductId);
+
+      if (!/^\d+$/.test(productId) || seenProductIds.has(productId)) {
+        return [];
+      }
+
+      seenProductIds.add(productId);
+      return [productId];
+    });
+}
+
+async function servePpomProductOptionsBatch(request, response, requestUrl) {
+  const productIds = parseProductIds(requestUrl.searchParams.get("product_ids"));
+
+  if (productIds.length === 0) {
+    sendJson(response, 200, { products: {}, errors: {} }, {}, request.method);
+    return;
+  }
+
+  const limitedProductIds = productIds.slice(0, 50);
+  const results = await Promise.all(
+    limitedProductIds.map(async (productId) => {
+      try {
+        const fields = await fetchPpomProductPageFields(productId);
+
+        return {
+          productId,
+          ppom_fields: fields,
+        };
+      } catch (error) {
+        return {
+          productId,
+          error: error instanceof Error ? error.message : "PPOM product options failed.",
+        };
+      }
+    }),
+  );
+
+  sendJson(
+    response,
+    200,
+    {
+      products: Object.fromEntries(
+        results.flatMap((result) =>
+          result.ppom_fields ? [[result.productId, { ppom_fields: result.ppom_fields }]] : [],
+        ),
+      ),
+      errors: Object.fromEntries(
+        results.flatMap((result) =>
+          result.error ? [[result.productId, { message: result.error }]] : [],
+        ),
+      ),
+    },
+    {},
+    request.method,
+  );
+}
+
 async function proxyPublicFeed(request, response, upstreamPath, search) {
   const upstreamUrl = new URL(upstreamPath, "https://www.royalpizza.co.th");
   upstreamUrl.search = search;
@@ -2098,6 +2192,11 @@ export async function handlePublicFeedProxyRequest(request, response) {
 
   if (requestUrl.pathname.match(/^\/api\/menu\/option-sets\/?$/)) {
     await servePpomOptionSets(request, response, requestUrl);
+    return;
+  }
+
+  if (requestUrl.pathname.match(/^\/api\/menu\/product-options\/?$/)) {
+    await servePpomProductOptionsBatch(request, response, requestUrl);
     return;
   }
 

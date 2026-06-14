@@ -358,4 +358,65 @@ describe("public feed proxy account endpoints", () => {
       errors: {},
     });
   });
+
+  it("serves batched product option fallbacks and reuses the rendered-page cache", async () => {
+    const productPageHtml = `
+      <input
+        type="radio"
+        class="radio ppom-input ppom-required"
+        value="Double Cheese"
+        data-price=""
+        data-optionid="1"
+        data-label="Double Cheese"
+        data-title="Select 8&quot; Pizza"
+        data-data_name="jun26_01_select_8_pizza"
+        checked="checked"
+      >
+    `;
+    const fetchMock = vi.fn(async (url) => {
+      const requestUrl = String(url);
+
+      if (requestUrl.includes("/wp-json/wc/v3/products/114602")) {
+        return jsonFetchResponse({ message: "Unauthorized" }, 401);
+      }
+
+      if (requestUrl.includes("/wp-json/wc/store/v1/products/114602")) {
+        return jsonFetchResponse({
+          id: 114602,
+          permalink: "https://example.test/product/bogo",
+        });
+      }
+
+      if (requestUrl === "https://example.test/product/bogo") {
+        return textFetchResponse(productPageHtml);
+      }
+
+      throw new Error(`Unexpected request ${requestUrl}`);
+    });
+    global.fetch = fetchMock;
+    const firstResponse = createResponse();
+    const secondResponse = createResponse();
+
+    await handlePublicFeedProxyRequest(
+      createRequest({
+        method: "GET",
+        url: "/api/menu/product-options?product_ids=114602,114602",
+      }),
+      firstResponse,
+    );
+    await handlePublicFeedProxyRequest(
+      createRequest({
+        method: "GET",
+        url: "/api/menu/product-options?product_ids=114602",
+      }),
+      secondResponse,
+    );
+
+    expect(firstResponse.status).toBe(200);
+    expect(firstResponse.json().products["114602"].ppom_fields).toHaveLength(1);
+    expect(secondResponse.json().products["114602"].ppom_fields).toHaveLength(1);
+    expect(
+      fetchMock.mock.calls.filter(([url]) => String(url) === "https://example.test/product/bogo"),
+    ).toHaveLength(1);
+  });
 });
