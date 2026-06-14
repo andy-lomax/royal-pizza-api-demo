@@ -909,6 +909,13 @@ function buildWooProductUrl(productId) {
   return url;
 }
 
+function buildStoreProductUrl(productId) {
+  return new URL(
+    `/wp-json/wc/store/v1/products/${encodeURIComponent(productId)}`,
+    siteUrl(),
+  );
+}
+
 function buildPpomOptionSetUrl(metaId) {
   const url = new URL(
     `/wp-json/ppom/v1/get/id/${encodeURIComponent(metaId)}`,
@@ -1052,20 +1059,49 @@ function normalizeWooCategory(category) {
 }
 
 async function fetchWooProductPermalink(productId) {
-  const upstreamResponse = await fetch(buildWooProductUrl(productId), {
+  let upstreamStatus = 0;
+
+  try {
+    const upstreamResponse = await fetch(buildWooProductUrl(productId), {
+      headers: {
+        Accept: "application/json",
+        Authorization: menuFeedAuthorization(),
+      },
+    });
+    upstreamStatus = upstreamResponse.status;
+
+    if (upstreamResponse.ok) {
+      const product = await upstreamResponse.json();
+      return textValue(product?.permalink);
+    }
+
+    if (![400, 401, 403].includes(upstreamResponse.status)) {
+      throw new Error(
+        `WooCommerce product request failed with HTTP ${upstreamResponse.status}.`,
+      );
+    }
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      !error.message.includes("Missing required environment variable")
+    ) {
+      throw error;
+    }
+  }
+
+  const storeResponse = await fetch(buildStoreProductUrl(productId), {
     headers: {
       Accept: "application/json",
-      Authorization: menuFeedAuthorization(),
     },
   });
 
-  if (!upstreamResponse.ok) {
+  if (!storeResponse.ok) {
     throw new Error(
-      `WooCommerce product request failed with HTTP ${upstreamResponse.status}.`,
+      `WooCommerce product request failed with HTTP ${upstreamStatus || storeResponse.status}.`,
     );
   }
 
-  const product = await upstreamResponse.json();
+  const product = await storeResponse.json();
   return textValue(product?.permalink);
 }
 

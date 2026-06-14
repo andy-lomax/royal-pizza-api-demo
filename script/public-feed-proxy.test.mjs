@@ -308,6 +308,10 @@ describe("public feed proxy account endpoints", () => {
       }
 
       if (requestUrl.includes("/wp-json/wc/v3/products/114601")) {
+        return jsonFetchResponse({ message: "Unauthorized" }, 401);
+      }
+
+      if (requestUrl.includes("/wp-json/wc/store/v1/products/114601")) {
         return jsonFetchResponse({
           id: 114601,
           permalink: "https://example.test/product/bogo",
