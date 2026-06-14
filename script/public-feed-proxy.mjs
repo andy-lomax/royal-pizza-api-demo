@@ -872,6 +872,7 @@ function buildWooProductsUrl({ categoryId, page, perPage }) {
       "sale_price",
       "images",
       "categories",
+      "meta_data",
     ].join(","),
   );
 
@@ -904,6 +905,17 @@ function buildWooProductUrl(productId) {
   );
 
   url.searchParams.set("_fields", ["id", "permalink"].join(","));
+
+  return url;
+}
+
+function buildPpomOptionSetUrl(metaId) {
+  const url = new URL(
+    `/wp-json/ppom/v1/get/id/${encodeURIComponent(metaId)}`,
+    siteUrl(),
+  );
+
+  url.searchParams.set("secret_key", requireEnv("PPOM_SECRET_KEY"));
 
   return url;
 }
@@ -975,6 +987,8 @@ function normalizeWooProduct(product) {
     numericText(productPrices.sale_price) ||
     price ||
     regularPrice;
+  const ppomMetaIds = normalizePpomMetaIds(product?.meta_data);
+  const ppomLookupKnown = Array.isArray(product?.meta_data);
 
   return {
     id: product.id,
@@ -1006,7 +1020,25 @@ function normalizeWooProduct(product) {
           slug: category?.slug,
         }))
       : [],
+    ppom_meta_ids: ppomMetaIds,
+    ppom_lookup_known: ppomLookupKnown,
   };
+}
+
+function normalizePpomMetaIds(metaData) {
+  if (!Array.isArray(metaData)) {
+    return [];
+  }
+
+  const entry = metaData.find((meta) => textValue(meta?.key) === "_product_meta_id");
+  const rawValue = entry?.value;
+  const values = Array.isArray(rawValue) ? rawValue : [rawValue];
+
+  return values.flatMap((value) => {
+    const text = textValue(value);
+
+    return text ? [text] : [];
+  });
 }
 
 function normalizeWooCategory(category) {
@@ -1469,6 +1501,79 @@ function ppomFieldsFromBody(body) {
   return Array.isArray(fields) ? fields : [];
 }
 
+function decodeHtmlEntities(value) {
+  return textValue(value)
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+
+function htmlAttributesFromTag(tag) {
+  const attributes = {};
+  const attributePattern = /([:\w-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+  let match;
+
+  while ((match = attributePattern.exec(tag))) {
+    const [, name, doubleQuoted, singleQuoted, unquoted] = match;
+    attributes[name.toLowerCase()] = decodeHtmlEntities(
+      doubleQuoted ?? singleQuoted ?? unquoted ?? "true",
+    );
+  }
+
+  return attributes;
+}
+
+function ppomFieldsFromProductPageHtml(productPageHtml) {
+  const fieldsByDataName = new Map();
+  const inputPattern = /<input\b[^>]*\bdata-data_name\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+)[^>]*>/gi;
+  let match;
+
+  while ((match = inputPattern.exec(productPageHtml))) {
+    const attributes = htmlAttributesFromTag(match[0]);
+    const dataName = textValue(attributes["data-data_name"]);
+    const option = decodeHtmlEntities(attributes["data-label"] || attributes.value);
+
+    if (!dataName || !option) {
+      continue;
+    }
+
+    const type = textValue(attributes.type).toLowerCase();
+    if (!["radio", "checkbox"].includes(type)) {
+      continue;
+    }
+
+    const title = decodeHtmlEntities(attributes["data-title"]) || dataName;
+    const field = fieldsByDataName.get(dataName) ?? {
+      title,
+      type,
+      data_name: dataName,
+      required: /\bppom-required\b/.test(textValue(attributes.class)),
+      options: [],
+    };
+    const choice = {
+      option,
+      id: textValue(attributes["data-optionid"]) || option,
+      price: textValue(attributes["data-price"]),
+    };
+
+    if (attributes.checked) {
+      if (type === "radio") {
+        choice.selected = true;
+      } else {
+        choice.checked = true;
+      }
+    }
+
+    field.options.push(choice);
+    fieldsByDataName.set(dataName, field);
+  }
+
+  return [...fieldsByDataName.values()];
+}
+
 function normalizePpomPageConditions(conditions) {
   if (!conditions || typeof conditions !== "object") {
     return undefined;
@@ -1578,6 +1683,28 @@ async function fetchPpomProductPageConditions(productId) {
   return ppomConditionsByDataNameFromPage(await upstreamResponse.text());
 }
 
+async function fetchPpomProductPageFields(productId) {
+  const permalink = await fetchWooProductPermalink(productId);
+
+  if (!permalink) {
+    return [];
+  }
+
+  const upstreamResponse = await fetch(permalink, {
+    headers: {
+      Accept: "text/html",
+    },
+  });
+
+  if (!upstreamResponse.ok) {
+    throw new Error(
+      `WooCommerce product page request failed with HTTP ${upstreamResponse.status}.`,
+    );
+  }
+
+  return ppomFieldsFromProductPageHtml(await upstreamResponse.text());
+}
+
 async function enrichPpomProductOptionsWithPageConditions(body, productId) {
   try {
     const conditionsByDataName = await fetchPpomProductPageConditions(productId);
@@ -1604,6 +1731,17 @@ async function proxyPpomProductOptions(request, response, productId) {
   const secretKey = process.env.PPOM_SECRET_KEY;
 
   if (!secretKey) {
+    try {
+      const fields = await fetchPpomProductPageFields(productId);
+
+      if (fields.length > 0) {
+        sendJson(response, 200, { ppom_fields: fields }, {}, request.method);
+        return;
+      }
+    } catch {
+      // Fall through to the existing configuration error.
+    }
+
     sendJson(response, 500, { error: "PPOM proxy is not configured." });
     return;
   }
@@ -1624,6 +1762,17 @@ async function proxyPpomProductOptions(request, response, productId) {
     const body = await upstreamResponse.text();
 
     if (!upstreamResponse.ok) {
+      try {
+        const fields = await fetchPpomProductPageFields(productId);
+
+        if (fields.length > 0) {
+          sendJson(response, 200, { ppom_fields: fields }, {}, request.method);
+          return;
+        }
+      } catch {
+        // Preserve the upstream PPOM error when page fallback is unavailable.
+      }
+
       response.writeHead(upstreamResponse.status, {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
@@ -1646,6 +1795,107 @@ async function proxyPpomProductOptions(request, response, productId) {
       error: error instanceof Error ? error.message : "PPOM options proxy failed.",
     });
   }
+}
+
+function parsePpomOptionSetRequests(value) {
+  const requestsByMetaId = new Map();
+
+  for (const entry of textValue(value).split(",")) {
+    const [rawMetaId, rawProductId] = entry.split(":");
+    const metaId = textValue(rawMetaId);
+    const productId = textValue(rawProductId);
+
+    if (!/^\d+$/.test(metaId) || !/^\d+$/.test(productId)) {
+      continue;
+    }
+
+    if (!requestsByMetaId.has(metaId)) {
+      requestsByMetaId.set(metaId, { metaId, productId });
+    }
+  }
+
+  return [...requestsByMetaId.values()];
+}
+
+async function fetchPpomOptionSetByMetaId({ metaId, productId }) {
+  const upstreamResponse = await fetch(buildPpomOptionSetUrl(metaId), {
+    headers: {
+      Accept: "application/json",
+    },
+  });
+  const body = await upstreamResponse.json().catch(() => ({}));
+
+  if (!upstreamResponse.ok) {
+    const fields = await fetchPpomProductPageFields(productId);
+
+    if (fields.length > 0) {
+      return { ppom_fields: fields };
+    }
+
+    throw new Error(`PPOM option-set ${metaId} failed with HTTP ${upstreamResponse.status}.`);
+  }
+
+  return enrichPpomProductOptionsWithPageConditions(body, productId);
+}
+
+async function servePpomOptionSets(request, response, requestUrl) {
+  if (!process.env.PPOM_SECRET_KEY) {
+    sendJson(response, 500, { error: "PPOM proxy is not configured." });
+    return;
+  }
+
+  const requests = parsePpomOptionSetRequests(requestUrl.searchParams.get("sets"));
+
+  if (requests.length === 0) {
+    sendJson(response, 200, { optionSets: {}, errors: {} }, {}, request.method);
+    return;
+  }
+
+  const results = await Promise.all(
+    requests.map(async ({ metaId, productId }) => {
+      const key = `ppom:${metaId}`;
+
+      try {
+        const body = await fetchPpomOptionSetByMetaId({ metaId, productId });
+
+        return {
+          key,
+          optionSet: {
+            metaId,
+            representativeProductId: productId,
+            ppom_fields: ppomFieldsFromBody(body),
+          },
+        };
+      } catch (error) {
+        return {
+          key,
+          error: {
+            metaId,
+            representativeProductId: productId,
+            message:
+              error instanceof Error ? error.message : "PPOM option-set request failed.",
+          },
+        };
+      }
+    }),
+  );
+
+  sendJson(
+    response,
+    200,
+    {
+      optionSets: Object.fromEntries(
+        results.flatMap((result) =>
+          result.optionSet ? [[result.key, result.optionSet]] : [],
+        ),
+      ),
+      errors: Object.fromEntries(
+        results.flatMap((result) => (result.error ? [[result.key, result.error]] : [])),
+      ),
+    },
+    {},
+    request.method,
+  );
 }
 
 async function proxyPublicFeed(request, response, upstreamPath, search) {
@@ -1807,6 +2057,11 @@ export async function handlePublicFeedProxyRequest(request, response) {
       );
     }
 
+    return;
+  }
+
+  if (requestUrl.pathname.match(/^\/api\/menu\/option-sets\/?$/)) {
+    await servePpomOptionSets(request, response, requestUrl);
     return;
   }
 
